@@ -3,7 +3,7 @@ name: Build and Deploy to Yandex Cloud
 on:
   push:
     tags:
-      - 'v*'  # Запуск при пуше тегов, начинающихся с 'v'
+      - '*' 
   pull_request:
     branches: [ main ]
 
@@ -29,8 +29,7 @@ jobs:
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
-    # Запускаем только для тегов, начинающихся с 'v'
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
 
     steps:
     - name: Checkout code
