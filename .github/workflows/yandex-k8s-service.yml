@@ -1,0 +1,303 @@
+name: Build and Deploy to Kubernetes
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: cr.yandex
+  IMAGE_NAME: cr.yandex/${{ secrets.YC_REGISTRY_ID }}/diplom-nginx-app-nginx
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Test Docker build
+      run: docker build -t test-diplom-nginx-image .
+
+    - name: Install HTML validator
+      run: |
+        npm install -g html-validate
+
+    - name: Validate HTML files
+      run: |
+        cat > .htmlvalidate.json << 'EOF'
+        {
+          "rules": {
+            "element-required-attributes": "off"
+          }
+        }
+        EOF
+        html-validate ./html/**/*.html
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Install and configure Yandex Cloud CLI
+      run: |
+        curl -s https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+        echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+
+    - name: Configure Yandex Cloud
+      run: |
+        sleep 2
+        echo '${{ secrets.YC_SA_JSON_KEY }}' > key.json
+        yc config set service-account-key key.json
+        yc config set cloud-id ${{ secrets.YC_CLOUD_ID }}
+        yc config set folder-id ${{ secrets.YC_FOLDER_ID }}
+
+    - name: Login to Yandex Container Registry using yc
+      run: |
+        IAM_TOKEN=$(yc iam create-token)
+        echo $IAM_TOKEN | docker login --username iam --password-stdin cr.yandex
+
+    - name: Extract tag name
+      id: tag
+      run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ env.IMAGE_NAME }}:latest
+          ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}
+        cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:latest
+        cache-to: type=inline
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+        chmod 600 ~/.kube/config
+
+    - name: Verify cluster access
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+
+    - name: Install and configure Yandex Cloud CLI for cluster
+      run: |
+        curl -s https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash
+        echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+
+    - name: Configure Yandex Cloud for cluster
+      run: |
+        sleep 2
+        echo '${{ secrets.YC_SA_JSON_KEY }}' > key.json
+        yc config set service-account-key key.json
+        yc config set cloud-id ${{ secrets.YC_CLOUD_ID }}
+        yc config set folder-id ${{ secrets.YC_FOLDER_ID }}
+
+    - name: Extract tag name
+      id: tag
+      run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Create namespace if not exists
+      run: |
+        if ! kubectl get namespace diplom-nginx-namespace; then
+          echo "Creating namespace diplom-nginx-namespace"
+          kubectl create namespace diplom-nginx-namespace
+        else
+          echo "Namespace diplom-nginx-namespace already exists"
+        fi
+
+    - name: Create registry secret using IAM token approach
+      run: |
+        IAM_TOKEN=$(yc iam create-token)
+
+        kubectl create secret docker-registry yc-registry-pull-secret \
+          --docker-server=cr.yandex \
+          --docker-username=iam \
+          --docker-password="$IAM_TOKEN" \
+          --namespace=diplom-nginx-namespace \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        kubectl patch serviceaccount default \
+          -n diplom-nginx-namespace \
+          -p '{"imagePullSecrets": [{"name": "yc-registry-pull-secret"}]}'
+
+        echo "Registry secret created using IAM token"
+
+    - name: Clean up old nginx resources
+      run: |
+        kubectl delete ingress nginx-ingress -n diplom-nginx-namespace --ignore-not-found=true
+        kubectl delete ingress nginx-app -n diplom-nginx-namespace --ignore-not-found=true
+
+        kubectl delete svc nginx-external -n monitoring --ignore-not-found=true
+
+        echo "=== Cleanup completed ==="
+
+    - name: Create nginx config (simplified)
+      run: |
+        cat > nginx-config.yaml << 'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: nginx-config
+          namespace: diplom-nginx-namespace
+        data:
+          nginx.conf: |
+            events {
+                worker_connections 1024;
+            }
+            http {
+                include /etc/nginx/mime.types;
+                default_type application/octet-stream;
+                server {
+                    listen 80;
+                    server_name _;
+                    location / {
+                        root /usr/share/nginx/html;
+                        index index.html;
+                        try_files $uri $uri/ /index.html;
+                    }
+                }
+            }
+        EOF
+        kubectl apply -f nginx-config.yaml
+
+    - name: Create or update deployment
+      run: |
+        cat > deployment.yaml << 'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: diplom-nginx-app
+          namespace: diplom-nginx-namespace
+          labels:
+            app: diplom-nginx-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: diplom-nginx-app
+          template:
+            metadata:
+              labels:
+                app: diplom-nginx-app
+            spec:
+              containers:
+              - name: diplom-nginx-app
+                image: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}
+                ports:
+                - containerPort: 80
+                resources:
+                  requests:
+                    memory: "64Mi"
+                    cpu: "50m"
+                  limits:
+                    memory: "128Mi"
+                    cpu: "100m"
+                volumeMounts:
+                - name: nginx-config
+                  mountPath: /etc/nginx/nginx.conf
+                  subPath: nginx.conf
+                livenessProbe:
+                  httpGet:
+                    path: /
+                    port: 80
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /
+                    port: 80
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+              volumes:
+              - name: nginx-config
+                configMap:
+                  name: nginx-config
+              imagePullSecrets:
+              - name: yc-registry-pull-secret
+        EOF
+        kubectl apply -f deployment.yaml
+
+    - name: Create or update service
+      run: |
+        cat > service.yaml << 'EOF'
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: diplom-nginx-service
+          namespace: diplom-nginx-namespace
+        spec:
+          selector:
+            app: diplom-nginx-app
+          ports:
+          - port: 80
+            targetPort: 80
+          type: ClusterIP
+        EOF
+        kubectl apply -f service.yaml
+
+    - name: Wait for deployment to be ready
+      run: |
+        kubectl rollout status deployment/diplom-nginx-app --namespace=diplom-nginx-namespace --timeout=300s
+        echo "=== Deployment ready ==="
+
+    - name: Create simple ingress in nginx namespace
+      run: |
+        cat > /tmp/nginx-ingress.yaml << 'EOF'
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: nginx-app
+          namespace: diplom-nginx-namespace
+        spec:
+          ingressClassName: nginx
+          rules:
+          - http:
+              paths:
+              - path: /nginx
+                pathType: Prefix
+                backend:
+                  service:
+                    name: diplom-nginx-service
+                    port:
+                      number: 80
+        EOF
+        kubectl apply -f /tmp/nginx-ingress.yaml
+        echo "=== Nginx Ingress created ==="
+        kubectl get ingress -A
+
+    - name: Verify everything works
+      run: |
+        echo "=== Final verification ==="
+        kubectl get deployments,pods,svc,ingress -n diplom-nginx-namespace
+        echo "=== Endpoints check ==="
+        kubectl get endpoints diplom-nginx-service -n diplom-nginx-namespace
+        echo "=== Pod IP ==="
+        kubectl get pod -n diplom-nginx-namespace -l app=diplom-nginx-app -o jsonpath='{.items[0].status.podIP}'
+        echo ""
