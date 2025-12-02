@@ -1,15 +1,13 @@
----
 name: Build and Deploy to Kubernetes
 
 on:
   push:
-    branches:
-      - main
     tags:
-      - "*"
-  pull_request:
+      - '**'
     branches:
-      - main
+      - '**'
+  pull_request:
+    branches: [ main ]
 
 env:
   REGISTRY: cr.yandex
@@ -26,7 +24,8 @@ jobs:
         run: docker build -t test-diplom-nginx-image .
 
       - name: Install HTML validator
-        run: npm install -g html-validate
+        run: |
+          npm install -g html-validate
 
       - name: Validate HTML files
         run: |
@@ -42,6 +41,7 @@ jobs:
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -65,11 +65,17 @@ jobs:
       - name: Login to Yandex Container Registry using yc
         run: |
           IAM_TOKEN=$(yc iam create-token)
-          echo "$IAM_TOKEN" | docker login --username iam --password-stdin cr.yandex
+          echo $IAM_TOKEN | docker login --username iam --password-stdin cr.yandex
 
       - name: Extract tag name
         id: tag
-        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -85,6 +91,7 @@ jobs:
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -120,11 +127,17 @@ jobs:
 
       - name: Extract tag name
         id: tag
-        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
 
       - name: Create namespace if not exists
         run: |
-          if ! kubectl get namespace diplom-nginx-namespace >/dev/null 2>&1; then
+          if ! kubectl get namespace diplom-nginx-namespace; then
             echo "Creating namespace diplom-nginx-namespace"
             kubectl create namespace diplom-nginx-namespace
           else
@@ -140,7 +153,8 @@ jobs:
             --docker-password="$IAM_TOKEN" \
             --namespace=diplom-nginx-namespace \
             --dry-run=client -o yaml | kubectl apply -f -
-          kubectl patch serviceaccount default -n diplom-nginx-namespace \
+          kubectl patch serviceaccount default \
+            -n diplom-nginx-namespace \
             -p '{"imagePullSecrets": [{"name": "yc-registry-pull-secret"}]}'
           echo "Registry secret created using IAM token"
 
@@ -288,9 +302,9 @@ jobs:
       - name: Verify everything works
         run: |
           echo "=== Final verification ==="
-          kubectl get deployments,pods,svc,ingress -n diplom-nginx-namespace -o wide
+          kubectl get deployments,pods,svc,ingress -n diplom-nginx-namespace
           echo "=== Endpoints check ==="
           kubectl get endpoints diplom-nginx-service -n diplom-nginx-namespace
-          echo "=== Pods (wide) ==="
-          kubectl get pods -n diplom-nginx-namespace -l app=diplom-nginx-app -o wide
+          echo "=== Pod IP ==="
+          kubectl get pod -n diplom-nginx-namespace -l app=diplom-nginx-app -o jsonpath='{.items[0].status.podIP}'
           echo ""
