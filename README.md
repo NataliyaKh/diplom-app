@@ -2,6 +2,7 @@
 App for diploma project
 
 ##Secrets Required in GitHub:
+
 - `KUBECONFIG`
 - `YC_CLOUD_ID`
 - `YC_FOLDER_ID`
